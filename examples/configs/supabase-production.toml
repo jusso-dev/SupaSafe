@@ -1,0 +1,40 @@
+# A hosted Supabase project.
+#
+# The introspection role is the setting worth adding. Without it, blast radius
+# is a structural estimate; with it, SupaSafe reports real row counts and real
+# cascade paths.
+#
+#   CREATE ROLE supasafe_readonly LOGIN PASSWORD '...';
+#   GRANT pg_read_all_stats TO supasafe_readonly;
+#   GRANT USAGE ON SCHEMA public TO supasafe_readonly;
+
+production_project_refs = ["abcdefghijklmnopqrst"]
+
+[proxy]
+listen = "127.0.0.1:6432"
+upstream_tls = true
+introspection_url = "postgresql://supasafe_readonly:CHANGE_ME@db.abcdefghijklmnopqrst.supabase.co:5432/postgres"
+
+[audit]
+path = "/var/log/supasafe/audit.jsonl"
+stdout_json = true
+
+[approvals]
+timeout_seconds = 600
+
+[context]
+extra_instructions = [
+  "Migrations live in supabase/migrations. Apply them with the Supabase CLI, never by hand.",
+  "The auth and storage schemas belong to Supabase. Do not read from them directly either; use the client libraries.",
+]
+
+[[database]]
+name = "acme-prod"
+project_ref = "abcdefghijklmnopqrst"
+environment = "production"
+policy = "production"
+
+[[database]]
+name = "acme-staging"
+project_ref = "uvwxyzabcdefghijklmn"
+environment = "staging"

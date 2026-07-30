@@ -1,0 +1,15 @@
+/target
+**/node_modules
+**/out
+*.vsix
+
+# Local state: audit trails and snapshots are not artefacts to commit.
+.supasafe/
+audit.jsonl
+snapshots/
+
+# A local supasafe.toml usually holds a connection string.
+/supasafe.toml
+.supasafe.toml
+
+.DS_Store

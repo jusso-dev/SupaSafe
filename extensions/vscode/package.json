@@ -1,0 +1,89 @@
+{
+  "name": "supasafe",
+  "displayName": "SupaSafe",
+  "description": "Check SQL against your SupaSafe policy before it reaches the database, and approve held statements without leaving the editor.",
+  "version": "0.1.0",
+  "publisher": "supasafe",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jusso-dev/supasafe.git",
+    "directory": "extensions/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Linters", "Other"],
+  "keywords": ["postgres", "postgresql", "supabase", "sql", "security"],
+  "activationEvents": ["onLanguage:sql", "onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "supasafe.analyzeSelection",
+        "title": "SupaSafe: Analyze selection",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "supasafe.analyzeFile",
+        "title": "SupaSafe: Analyze this file"
+      },
+      {
+        "command": "supasafe.showApprovals",
+        "title": "SupaSafe: Show statements awaiting approval"
+      },
+      {
+        "command": "supasafe.openDashboard",
+        "title": "SupaSafe: Open dashboard"
+      },
+      {
+        "command": "supasafe.showContext",
+        "title": "SupaSafe: Show the rules for this database"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "supasafe.analyzeSelection",
+          "when": "editorHasSelection && editorLangId == sql",
+          "group": "supasafe"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SupaSafe",
+      "properties": {
+        "supasafe.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7717",
+          "description": "The SupaSafe dashboard to talk to. Started by `supasafe start`."
+        },
+        "supasafe.targetHost": {
+          "type": "string",
+          "default": "",
+          "description": "Judge statements as if they were going to this host, e.g. db.abcdefgh.supabase.co. Leave empty to use the environment SupaSafe detects."
+        },
+        "supasafe.analyzeOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Analyse .sql files when you save them, and show anything risky in the Problems panel."
+        },
+        "supasafe.approver": {
+          "type": "string",
+          "default": "",
+          "description": "The name recorded against approvals you give from the editor. Defaults to your git user name."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

@@ -1,0 +1,51 @@
+# A team with a production database, a shared staging database, and a migration
+# runner that should not need a prompt.
+
+[proxy]
+listen = "127.0.0.1:6432"
+introspection_url = "postgresql://supasafe_readonly:CHANGE_ME@db.example.com:5432/app"
+
+[context]
+extra_instructions = [
+  "Never touch the billing schema. Finance reconciles it nightly.",
+  "Ask before you write to any table you did not create in this session.",
+]
+
+[[database]]
+name = "prod"
+host = "db.example.com"
+environment = "production"
+
+[[database]]
+name = "staging"
+host = "staging-db.example.com"
+environment = "staging"
+
+[[database]]
+name = "local"
+host = "127.0.0.1"
+environment = "local"
+
+# Rules added here are put in front of the built-in production rules, and the
+# first match wins, so these decide before anything else does.
+
+[[policies.production.rules]]
+name = "billing-is-off-limits"
+action = "deny"
+message = "The billing schema is reconciled nightly. Changes go through finance."
+when = { objects = ["billing.*"], categories = ["write", "ddl"] }
+
+[[policies.production.rules]]
+name = "money-needs-two-people"
+action = "require_approval"
+approvals = 2
+message = "Financial data needs a second pair of eyes."
+when = { objects = ["public.payments", "public.invoices", "public.ledger_*"] }
+
+# `application_name` is not authentication: anyone who can connect can claim any
+# name. This is a convenience on a trusted network, not a security boundary.
+[[policies.production.rules]]
+name = "migration-runner"
+action = "allow"
+message = "The migration runner is reviewed in CI before it ever connects."
+when = { agents = ["migration-runner"], categories = ["ddl"], max_risk = 79 }

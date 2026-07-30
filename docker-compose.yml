@@ -1,0 +1,68 @@
+# The whole thing, locally.
+#
+#   docker compose up --build
+#
+# Gives you:
+#
+#   * PostgreSQL 16, seeded with a schema whose foreign keys cascade, so the
+#     blast radius numbers are real rather than illustrative
+#   * SupaSafe in front of it, treating it as production
+#   * the proxy on 127.0.0.1:6432 and the dashboard on http://127.0.0.1:7717
+#
+# The database port is deliberately not published. The only way in is through
+# SupaSafe, which is the arrangement you want in real life too: an agent that
+# can reach the database directly can go around anything in front of it.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - ./examples/docker/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  supasafe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Bound to loopback. The dashboard can change what the proxy lets
+      # through, so it is not something to put on a network by accident.
+      - "127.0.0.1:6432:6432"
+      - "127.0.0.1:7717:7717"
+    environment:
+      SUPASAFE_LOG: supasafe=info
+    volumes:
+      # The example config, mounted read-only as a seed.
+      - ./examples/docker/supasafe.toml:/etc/supasafe/supasafe.toml:ro
+      # The working copy, the audit trail and snapshots. Rule changes made in
+      # the dashboard are written here and survive a restart.
+      - supasafe-state:/var/lib/supasafe
+
+    # On first run the seed config is copied somewhere the container can write
+    # to, because a config file the dashboard cannot save to is a dashboard
+    # with its editor greyed out. `docker compose down -v` resets it to the
+    # file in the repository.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        [ -f /var/lib/supasafe/supasafe.toml ] \
+          || cp /etc/supasafe/supasafe.toml /var/lib/supasafe/supasafe.toml
+        exec supasafe --config /var/lib/supasafe/supasafe.toml start \
+          --upstream postgresql://postgres:postgres@postgres:5432/postgres \
+          --listen 0.0.0.0:6432 \
+          --dashboard 0.0.0.0:7717
+
+volumes:
+  pgdata:
+  supasafe-state:
