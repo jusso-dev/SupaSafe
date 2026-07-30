@@ -1,0 +1,26 @@
+# Two approvers for every change, a snapshot before anything destructive, and a
+# dry run before anything wide.
+#
+# The regulated policy refuses TRUNCATE, DROP SCHEMA and DROP DATABASE outright
+# rather than offering an approval path. Under an audit regime those belong in a
+# reviewed migration, not in an agent session at 2am.
+
+[approvals]
+timeout_seconds = 1800
+require_distinct_approver = true
+
+[audit]
+path = "/var/log/supasafe/audit.jsonl"
+stdout_json = true
+
+[snapshots]
+directory = "/var/backups/supasafe"
+
+[proxy]
+introspection_url = "postgresql://supasafe_readonly:CHANGE_ME@db.example.com:5432/app"
+
+[[database]]
+name = "regulated-prod"
+host = "db.example.com"
+environment = "production"
+policy = "regulated"

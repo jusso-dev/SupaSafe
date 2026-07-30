@@ -1,0 +1,27 @@
+[package]
+name = "supasafe-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dashboard and approval API for SupaSafe"
+categories.workspace = true
+
+[dependencies]
+supasafe-core.workspace = true
+supasafe-parser.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-stream.workspace = true
+futures-core.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "supasafe-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AST-based SQL analysis for SupaSafe. Parses PostgreSQL statements into a semantic model. Never uses regex."
+keywords = ["postgres", "sql", "parser", "ast", "security"]
+categories.workspace = true
+
+[dependencies]
+sqlparser.workspace = true
+serde.workspace = true
+thiserror.workspace = true

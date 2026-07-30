@@ -1,0 +1,24 @@
+# The compose example declares the database as production so you can watch the
+# production policy work without owning a production database.
+
+[audit]
+path = "/var/lib/supasafe/audit.jsonl"
+stdout_json = true
+
+[snapshots]
+directory = "/var/lib/supasafe/snapshots"
+
+[proxy]
+# The database is on the container network, so there is nothing to protect with
+# TLS here. Do not copy this line to a real deployment.
+upstream_tls = false
+
+# With this set, blast radius is measured rather than estimated: real row
+# counts from pg_class, real cascade paths from pg_constraint.
+introspection_url = "postgresql://postgres:postgres@postgres:5432/postgres"
+
+[[database]]
+name = "demo"
+host = "postgres"
+environment = "production"
+policy = "production"

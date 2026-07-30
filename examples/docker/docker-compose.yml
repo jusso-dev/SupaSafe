@@ -1,0 +1,54 @@
+# SupaSafe in front of a local PostgreSQL, for trying it out.
+#
+#   docker compose up
+#   psql postgresql://postgres:postgres@127.0.0.1:6432/postgres -c "DELETE FROM signups"
+#
+# The proxy is on 6432 and the dashboard on 7717. The database itself is not
+# published, so the only way in is through SupaSafe. That is the arrangement you
+# want in real life too: an agent that can reach the database directly can go
+# around anything in front of it.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  supasafe:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "6432:6432"
+      - "7717:7717"
+    environment:
+      SUPASAFE_LOG: supasafe=info
+    volumes:
+      - ./supasafe.toml:/etc/supasafe/supasafe.toml:ro
+      - supasafe-state:/var/lib/supasafe
+    command:
+      - --config
+      - /etc/supasafe/supasafe.toml
+      - start
+      - --upstream
+      - postgresql://postgres:postgres@postgres:5432/postgres
+      - --listen
+      - 0.0.0.0:6432
+      - --dashboard
+      - 0.0.0.0:7717
+
+volumes:
+  pgdata:
+  supasafe-state:

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/supasafe-parser",
+    "crates/supasafe-core",
+    "crates/supasafe-proxy",
+    "crates/supasafe-server",
+    "crates/supasafe-mcp",
+    "crates/supasafe-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/jusso-dev/supasafe"
+homepage = "https://github.com/jusso-dev/supasafe"
+authors = ["SupaSafe contributors"]
+description = "AI Database Safety Guard for PostgreSQL and Supabase"
+keywords = ["postgres", "supabase", "sql", "security", "ai"]
+categories = ["database", "development-tools"]
+
+[workspace.dependencies]
+supasafe-parser = { path = "crates/supasafe-parser", version = "0.1.0" }
+supasafe-core = { path = "crates/supasafe-core", version = "0.1.0" }
+supasafe-proxy = { path = "crates/supasafe-proxy", version = "0.1.0" }
+supasafe-server = { path = "crates/supasafe-server", version = "0.1.0" }
+supasafe-mcp = { path = "crates/supasafe-mcp", version = "0.1.0" }
+
+sqlparser = "0.62"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs", "process", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.11"
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+clap = { version = "4", features = ["derive", "env"] }
+globset = "0.4"
+hex = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+base64 = "0.22"
+async-stream = "0.3"
+futures-core = "0.3"
+tower = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"

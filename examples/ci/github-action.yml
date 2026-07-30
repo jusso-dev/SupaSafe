@@ -1,0 +1,29 @@
+# Drop this into .github/workflows/ to check migrations on every pull request.
+#
+# This is the cheapest place to catch a destructive migration: before it is
+# merged, rather than when an agent runs it.
+
+name: SQL safety
+
+on:
+  pull_request:
+    paths: ["**/*.sql"]
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # analyze needs the base branch to diff against.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install supasafe-cli --locked
+
+      - name: Check the migrations in this pull request
+        env:
+          # Only the host matters: nothing connects, but it is how SupaSafe
+          # decides which environment and policy to judge against.
+          SUPASAFE_TARGET: postgresql://postgres@db.abcdefgh.supabase.co:5432/postgres
+        run: ./examples/ci/check-migrations.sh origin/${{ github.base_ref }}

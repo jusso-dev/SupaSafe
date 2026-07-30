@@ -1,0 +1,31 @@
+[package]
+name = "supasafe-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SupaSafe command line interface: the AI database safety guard for PostgreSQL and Supabase"
+keywords = ["postgres", "supabase", "cli", "security", "ai"]
+categories.workspace = true
+
+[[bin]]
+name = "supasafe"
+path = "src/main.rs"
+
+[dependencies]
+supasafe-core.workspace = true
+supasafe-parser.workspace = true
+supasafe-proxy.workspace = true
+supasafe-server.workspace = true
+supasafe-mcp.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
