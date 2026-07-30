@@ -206,24 +206,29 @@ fn init_tracing(verbose: bool, json: bool) {
 /// Returns the process exit code.
 async fn run(cli: Cli) -> Result<i32> {
     let config = load_config(cli.config.as_deref())?;
+    // Where edits made in the dashboard get written back to.
+    let config_path = cli.config.clone().or_else(Config::discover);
 
     match cli.command {
         Command::Start {
             upstream,
             listen,
             dashboard,
-        } => start(config, &upstream, listen, dashboard, true).await,
+        } => start(config, config_path, &upstream, listen, dashboard, true).await,
 
-        Command::Proxy { upstream, listen } => start(config, &upstream, listen, None, false).await,
+        Command::Proxy { upstream, listen } => {
+            start(config, config_path, &upstream, listen, None, false).await
+        }
 
         Command::Serve { listen } => {
-            let guard = build_guard(&config)?;
+            let allow_editing = config.server.allow_policy_editing;
+            let guard = build_guard(&config, config_path)?;
             let addr = listen
                 .unwrap_or_else(|| config.server.listen.clone())
                 .parse()
                 .context("the dashboard address is not a valid host:port")?;
             println!("{} dashboard on http://{addr}", format::green("→"));
-            supasafe_server::serve(addr, guard).await?;
+            supasafe_server::serve_with(addr, guard, allow_editing).await?;
             Ok(0)
         }
 
@@ -255,14 +260,14 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Init { force, output } => init(&output, force),
 
         Command::Context { target } => {
-            let guard = build_guard(&config)?;
+            let guard = build_guard(&config, config_path)?;
             let target = parse_target(target.as_deref())?;
             println!("{}", guard.agent_context(&target));
             Ok(0)
         }
 
         Command::Mcp { upstream } => {
-            let guard = build_guard(&config)?;
+            let guard = build_guard(&config, config_path)?;
             let target = parse_target(upstream.as_deref())?;
             let snapshots = build_snapshots(&config, upstream.as_deref());
             let server = Arc::new(supasafe_mcp::McpServer::new(guard, snapshots, target));
@@ -281,7 +286,7 @@ fn load_config(path: Option<&std::path::Path>) -> Result<Config> {
     }
 }
 
-fn build_guard(config: &Config) -> Result<Arc<Guard>> {
+fn build_guard(config: &Config, path: Option<PathBuf>) -> Result<Arc<Guard>> {
     let compiled = config
         .compile()
         .context("the policy configuration is not valid")?;
@@ -296,7 +301,9 @@ fn build_guard(config: &Config) -> Result<Arc<Guard>> {
         require_distinct_approver: config.approvals.require_distinct_approver,
     });
 
-    Ok(Arc::new(Guard::new(compiled, Arc::new(audit), approvals)))
+    Ok(Arc::new(
+        Guard::new(compiled, Arc::new(audit), approvals).with_config_path(path),
+    ))
 }
 
 fn build_snapshots(config: &Config, upstream: Option<&str>) -> Arc<SnapshotManager> {
@@ -327,6 +334,7 @@ fn parse_target(url: Option<&str>) -> Result<ConnectionTarget> {
 
 async fn start(
     config: Config,
+    config_path: Option<PathBuf>,
     upstream: &str,
     listen: Option<String>,
     dashboard: Option<String>,
@@ -335,7 +343,7 @@ async fn start(
     let target = ConnectionTarget::from_url(upstream)
         .with_context(|| format!("{upstream:?} is not a PostgreSQL URL"))?;
 
-    let guard = build_guard(&config)?;
+    let guard = build_guard(&config, config_path)?;
     let snapshots = build_snapshots(&config, Some(upstream));
 
     let listen_addr: std::net::SocketAddr = listen
@@ -373,10 +381,37 @@ async fn start(
     ));
     let listener = proxy.bind().await?;
 
-    let info = guard.config().classify(&target);
-    let policy = guard.config().policy_for(&info);
+    // Blast radius is a structural estimate until this connects. With it, row
+    // counts and cascade paths are read from the catalogue rather than guessed.
+    let catalog_source = config
+        .proxy
+        .introspection_url
+        .clone()
+        .and_then(|url| supasafe_proxy::client::ClientConfig::from_url(&url))
+        // The introspection connection is SupaSafe talking to your database,
+        // so it follows the same TLS decision the proxy's own upstream does.
+        .map(|c| c.with_upstream_tls(config.proxy.upstream_tls));
+    if let Some(source) = catalog_source {
+        let guard_for_catalog = guard.clone();
+        tokio::spawn(supasafe_proxy::introspect::keep_fresh(
+            guard_for_catalog,
+            source,
+            supasafe_proxy::introspect::DEFAULT_REFRESH,
+        ));
+    } else if config.proxy.introspection_url.is_some() {
+        tracing::warn!(
+            "proxy.introspection_url is not a PostgreSQL URL; blast radius will be estimated"
+        );
+    }
 
-    format::banner(&info, policy.name(), &listen_addr.to_string());
+    let (environment, policy_name) = {
+        let config = guard.config();
+        let info = config.classify(&target);
+        let name = config.policy_for(&info).name().to_string();
+        (info, name)
+    };
+
+    format::banner(&environment, &policy_name, &listen_addr.to_string());
 
     if with_dashboard {
         let dashboard_addr: std::net::SocketAddr = dashboard
@@ -385,8 +420,11 @@ async fn start(
             .context("the dashboard address is not a valid host:port")?;
         println!("  {} dashboard   http://{dashboard_addr}", format::dim("│"));
         let guard_for_server = guard.clone();
+        let allow_editing = config.server.allow_policy_editing;
         tokio::spawn(async move {
-            if let Err(e) = supasafe_server::serve(dashboard_addr, guard_for_server).await {
+            if let Err(e) =
+                supasafe_server::serve_with(dashboard_addr, guard_for_server, allow_editing).await
+            {
                 tracing::error!(error = %e, "the dashboard stopped");
             }
         });

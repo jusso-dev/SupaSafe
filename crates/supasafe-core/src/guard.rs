@@ -7,7 +7,8 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use uuid::Uuid;
 
 use supasafe_parser::{analyze, Batch, StatementAnalysis};
@@ -16,7 +17,7 @@ use crate::approval::{deadline, ApprovalRequest, ApprovalState, ApprovalStore};
 use crate::audit::{hash_prompt, AuditEntry, AuditLog, Outcome};
 use crate::blast::{self, BlastRadius};
 use crate::catalog::CatalogSnapshot;
-use crate::config::CompiledConfig;
+use crate::config::{CompiledConfig, Config, ConfigError};
 use crate::context;
 use crate::environment::{ConnectionTarget, EnvironmentInfo};
 use crate::policy::{Decision, MatchContext, PolicyOutcome};
@@ -143,7 +144,14 @@ impl Verdict {
 
 /// The component every entry point talks to.
 pub struct Guard {
-    config: CompiledConfig,
+    /// Behind a lock because policies can be edited while the proxy is running.
+    /// A rule you change in the dashboard applies to the next statement, which
+    /// is the point: tuning a rule you cannot try out is guesswork.
+    config: RwLock<CompiledConfig>,
+    /// Where the configuration came from, so edits can be persisted back.
+    /// `None` means the configuration was built in memory and edits will not
+    /// survive a restart, which the dashboard says out loud.
+    config_path: Option<PathBuf>,
     audit: Arc<AuditLog>,
     approvals: ApprovalStore,
     catalog: RwLock<Option<CatalogSnapshot>>,
@@ -152,8 +160,9 @@ pub struct Guard {
 impl std::fmt::Debug for Guard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Guard")
-            .field("policies", &self.config.policy_names())
-            .field("has_catalog", &self.catalog.read().is_ok())
+            .field("policies", &self.config().policy_names())
+            .field("config_path", &self.config_path)
+            .field("has_catalog", &self.has_catalog())
             .finish()
     }
 }
@@ -161,15 +170,72 @@ impl std::fmt::Debug for Guard {
 impl Guard {
     pub fn new(config: CompiledConfig, audit: Arc<AuditLog>, approvals: ApprovalStore) -> Guard {
         Guard {
-            config,
+            config: RwLock::new(config),
+            config_path: None,
             audit,
             approvals,
             catalog: RwLock::new(None),
         }
     }
 
-    pub fn config(&self) -> &CompiledConfig {
-        &self.config
+    /// Remember where the configuration lives, so policy edits can be written
+    /// back to it.
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Guard {
+        self.config_path = path;
+        self
+    }
+
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Read access to the live configuration.
+    pub fn config(&self) -> RwLockReadGuard<'_, CompiledConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Swap in a new configuration. Takes effect on the next statement.
+    ///
+    /// The caller has already compiled it, which is what proves it is valid:
+    /// there is no path here that installs a policy the engine cannot run.
+    pub fn replace_config(&self, config: CompiledConfig) {
+        let mut current = self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = config;
+    }
+
+    /// Apply an edit to the configuration and, if a path is known, persist it.
+    ///
+    /// The edit runs against a copy. Nothing is installed and nothing is
+    /// written until the result compiles, so a rule with a bad glob leaves the
+    /// running policy exactly as it was.
+    pub fn edit_config<F>(&self, edit: F) -> Result<(), ConfigError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), ConfigError>,
+    {
+        let mut draft = self.config().config.clone();
+        edit(&mut draft)?;
+        let compiled = draft.compile()?;
+
+        if let Some(path) = &self.config_path {
+            draft.save(path)?;
+        }
+        self.replace_config(compiled);
+        Ok(())
+    }
+
+    /// Re-read the configuration from disk.
+    pub fn reload_config(&self) -> Result<(), ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Ok(());
+        };
+        let config = Config::load(path)?;
+        self.replace_config(config.compile()?);
+        Ok(())
     }
 
     pub fn audit(&self) -> &AuditLog {
@@ -198,8 +264,9 @@ impl Guard {
     /// Analyse and judge a request without executing anything or writing to
     /// the audit trail.
     pub fn evaluate(&self, request: &Request, target: &ConnectionTarget) -> Verdict {
-        let info = self.config.classify(target);
-        let policy = self.config.policy_for(&info);
+        let config = self.config();
+        let info = config.classify(target);
+        let policy = config.policy_for(&info);
         let batch: Batch = analyze(&request.sql);
 
         let catalog_guard = self.catalog.read().ok();
@@ -276,11 +343,11 @@ impl Guard {
         recovery_point: Option<String>,
     ) -> ApprovalRequest {
         let dominant = verdict.dominant();
-        let timeout = self
-            .config
+        let config = self.config();
+        let timeout = config
             .policy(&verdict.policy)
             .map(|p| p.policy.approval_timeout_seconds)
-            .unwrap_or(self.config.config.approvals.timeout_seconds);
+            .unwrap_or(config.config.approvals.timeout_seconds);
 
         let approval = ApprovalRequest {
             id: verdict.id,
@@ -371,13 +438,10 @@ impl Guard {
 
     /// The standing instructions for agents on this connection.
     pub fn agent_context(&self, target: &ConnectionTarget) -> String {
-        let info = self.config.classify(target);
-        let policy = self.config.policy_for(&info);
-        context::instructions(
-            &info,
-            policy,
-            &self.config.config.context.extra_instructions,
-        )
+        let config = self.config();
+        let info = config.classify(target);
+        let policy = config.policy_for(&info);
+        context::instructions(&info, policy, &config.config.context.extra_instructions)
     }
 }
 

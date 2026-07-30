@@ -59,6 +59,12 @@ pub struct ServerConfig {
     pub listen: String,
     /// Open the dashboard in a browser when `supasafe start` runs.
     pub open_browser: bool,
+    /// Allow policy rules to be changed from the dashboard.
+    ///
+    /// On by default, because tuning a rule you cannot try out is guesswork.
+    /// Turn it off if you expose the dashboard beyond loopback: an edit here
+    /// changes what the proxy lets through, immediately.
+    pub allow_policy_editing: bool,
 }
 
 impl Default for ServerConfig {
@@ -66,6 +72,7 @@ impl Default for ServerConfig {
         Self {
             listen: "127.0.0.1:7717".to_string(),
             open_browser: false,
+            allow_policy_editing: true,
         }
     }
 }
@@ -279,6 +286,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("could not write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Policy(#[from] PolicyError),
 }
@@ -291,18 +303,25 @@ impl Config {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let mut config: Config = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        Config::parse(&text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
-            source: e,
-        })?;
+            source,
+        })
+    }
 
-        // Which keys the file actually set, so inheritance can tell "left out"
+    /// Parse configuration from TOML text, resolving policy inheritance and
+    /// filling in any built-in policy the text did not mention.
+    ///
+    /// This is the only path that turns text into a `Config`, so configuration
+    /// typed into the dashboard behaves exactly like configuration read from
+    /// disk. A second, subtly different parser is how a policy comes to mean
+    /// one thing in a file and another over HTTP.
+    pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
+        let mut config: Config = toml::from_str(text)?;
+
+        // Which keys the text actually set, so inheritance can tell "left out"
         // from "set to the same value the default happens to have".
-        let declared: toml::Table = toml::from_str(&text).map_err(|e| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-
+        let declared: toml::Table = toml::from_str(text)?;
         config.resolve_inheritance(&declared);
 
         for (name, policy) in builtin_policies() {
@@ -322,6 +341,20 @@ impl Config {
         let names: Vec<String> = self.policies.keys().cloned().collect();
 
         for name in names {
+            // Only policies the text actually declared take part in
+            // inheritance. Serde fills an absent `policies` table with the
+            // built-in map, and merging those with themselves would list every
+            // built-in rule twice for a file that never mentioned policies at
+            // all.
+            let declared_here = declared
+                .get("policies")
+                .and_then(|p| p.as_table())
+                .map(|p| p.contains_key(&name))
+                .unwrap_or(false);
+            if !declared_here {
+                continue;
+            }
+
             let policy = &self.policies[&name];
             let base_name = policy.extends.clone().unwrap_or_else(|| name.clone());
 
@@ -380,12 +413,18 @@ impl Config {
                 merged.approval_timeout_seconds = own.approval_timeout_seconds;
             }
 
-            // The operator's rules go first: rules are ordered and the first
-            // match wins, so this is what lets a local rule override a
-            // built-in decision rather than sit behind it forever.
-            let mut rules = own.rules;
-            rules.extend(base.rules.iter().cloned());
-            merged.rules = rules;
+            merged.inherit_rules = own.inherit_rules;
+            if own.inherit_rules {
+                // The operator's rules go first: rules are ordered and the
+                // first match wins, so this is what lets a local rule override
+                // a built-in decision rather than sit behind it forever.
+                let mut rules = own.rules;
+                rules.extend(base.rules.iter().cloned());
+                merged.rules = rules;
+            } else {
+                // The text already holds the complete list.
+                merged.rules = own.rules;
+            }
 
             self.policies.insert(name, merged);
         }
@@ -427,6 +466,184 @@ impl Config {
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
+
+    /// Write the configuration back to disk.
+    ///
+    /// Prefers writing to a temporary file and renaming it into place, so an
+    /// interrupted save cannot leave a half-written policy behind. A truncated
+    /// `supasafe.toml` is a proxy that refuses to start, and it would happen at
+    /// exactly the moment somebody was editing rules under pressure.
+    ///
+    /// Falls back to writing in place when the rename cannot work. That is not
+    /// hypothetical: bind-mounting a single config file into a container, which
+    /// is how most people deploy one, makes the target a mount point and
+    /// `rename` onto it fails with `EBUSY`.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        // Refuse to persist something that would not load again.
+        self.compile()?;
+
+        // What is written is the resolved policy, rules and all. Mark it so
+        // that loading it back does not merge the built-in rules in a second
+        // time and leave every rule listed twice.
+        let mut resolved = self.clone();
+        for policy in resolved.policies.values_mut() {
+            policy.inherit_rules = false;
+        }
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?;
+            }
+        }
+
+        let mut text = String::from(
+            "# SupaSafe configuration.\n\
+             #\n\
+             # Written by SupaSafe. Hand edits are preserved in meaning but not\n\
+             # in formatting: saving from the dashboard rewrites this file.\n\n",
+        );
+        text.push_str(&resolved.to_toml());
+
+        let temporary = path.with_extension("toml.tmp");
+        match std::fs::write(&temporary, &text).and_then(|_| std::fs::rename(&temporary, path)) {
+            Ok(()) => Ok(()),
+            Err(rename_failed) => {
+                // Never leave the half-written file lying next to the real one.
+                let _ = std::fs::remove_file(&temporary);
+
+                std::fs::write(path, &text).map_err(|in_place_failed| ConfigError::Write {
+                    path: path.to_path_buf(),
+                    // Report the error from writing the real file: it is the
+                    // one that tells the operator what to fix, usually a
+                    // permission or a read-only mount.
+                    source: if in_place_failed.kind() == std::io::ErrorKind::PermissionDenied {
+                        in_place_failed
+                    } else {
+                        rename_failed
+                    },
+                })
+            }
+        }
+    }
+
+    /// The policy by name, for editing.
+    pub fn policy_mut(&mut self, name: &str) -> Option<&mut Policy> {
+        self.policies.get_mut(name)
+    }
+
+    /// Add a rule to a policy.
+    ///
+    /// New rules go to the front by default, because rules are ordered and the
+    /// first match wins. A rule appended to the end of the production policy
+    /// would sit behind the catch-all and never fire, which is a confusing way
+    /// to discover how the engine works.
+    pub fn add_rule(
+        &mut self,
+        policy: &str,
+        rule: Rule,
+        at: Option<usize>,
+    ) -> Result<(), EditError> {
+        self.with_rules(policy, |rules| {
+            let index = at.unwrap_or(0).min(rules.len());
+            rules.insert(index, rule);
+            Ok(())
+        })
+    }
+
+    /// Replace a rule in place.
+    pub fn update_rule(&mut self, policy: &str, index: usize, rule: Rule) -> Result<(), EditError> {
+        let name = policy.to_string();
+        self.with_rules(policy, |rules| {
+            if index >= rules.len() {
+                return Err(EditError::NoSuchRule {
+                    policy: name,
+                    index,
+                });
+            }
+            rules[index] = rule;
+            Ok(())
+        })
+    }
+
+    /// Remove a rule.
+    pub fn remove_rule(&mut self, policy: &str, index: usize) -> Result<Rule, EditError> {
+        let name = policy.to_string();
+        let mut removed = None;
+        self.with_rules(policy, |rules| {
+            if index >= rules.len() {
+                return Err(EditError::NoSuchRule {
+                    policy: name,
+                    index,
+                });
+            }
+            removed = Some(rules.remove(index));
+            Ok(())
+        })?;
+        removed.ok_or_else(|| EditError::NoSuchRule {
+            policy: policy.to_string(),
+            index,
+        })
+    }
+
+    /// Apply a change to a policy's rules, and keep it only if the result still
+    /// compiles.
+    ///
+    /// The change is made to a copy. A rule with a bad glob leaves the
+    /// configuration exactly as it was rather than sitting in it, invalid,
+    /// waiting to fail the next time anything touches the policy.
+    fn with_rules<F>(&mut self, policy: &str, change: F) -> Result<(), EditError>
+    where
+        F: FnOnce(&mut Vec<Rule>) -> Result<(), EditError>,
+    {
+        let existing = self
+            .policies
+            .get(policy)
+            .ok_or_else(|| EditError::NoSuchPolicy(policy.to_string()))?;
+
+        let mut candidate = existing.clone();
+        candidate.name = policy.to_string();
+        change(&mut candidate.rules)?;
+
+        CompiledPolicy::compile(candidate.clone())
+            .map_err(|e| EditError::Invalid(e.to_string()))?;
+
+        self.policies.insert(policy.to_string(), candidate);
+        Ok(())
+    }
+
+    /// Move a rule to a different position. Order is the whole semantics of the
+    /// rule list, so this is a first-class operation rather than a delete and
+    /// an insert.
+    pub fn move_rule(&mut self, policy: &str, from: usize, to: usize) -> Result<(), EditError> {
+        let target = self
+            .policies
+            .get_mut(policy)
+            .ok_or_else(|| EditError::NoSuchPolicy(policy.to_string()))?;
+        if from >= target.rules.len() {
+            return Err(EditError::NoSuchRule {
+                policy: policy.to_string(),
+                index: from,
+            });
+        }
+        let rule = target.rules.remove(from);
+        let to = to.min(target.rules.len());
+        target.rules.insert(to, rule);
+        Ok(())
+    }
+}
+
+/// Something wrong with an edit, reported before it is applied anywhere.
+#[derive(Debug, thiserror::Error)]
+pub enum EditError {
+    #[error("no policy named {0:?}")]
+    NoSuchPolicy(String),
+    #[error("policy {policy:?} has no rule at position {index}")]
+    NoSuchRule { policy: String, index: usize },
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// Configuration with policies compiled and ready to evaluate.
@@ -1065,6 +1282,172 @@ mod tests {
         assert_eq!(policy.approvals_required, 2);
         assert!(!policy.rules.is_empty(), "did not inherit rules");
         assert_eq!(policy.default, "deny");
+    }
+
+    #[test]
+    fn a_config_with_no_policies_section_gets_the_builtins_exactly_once() {
+        // A file that says nothing about policies is the common case. Serde
+        // fills the absent table from Config::default(), which is the built-in
+        // map, so inheritance has to leave those alone or every rule appears
+        // twice.
+        let expected = builtin_policies()["production"].rules.len();
+        let config = load_from_str("[audit]\nstore_raw_sql = false\n");
+        assert_eq!(config.policies["production"].rules.len(), expected);
+
+        let names: Vec<&str> = config.policies["production"]
+            .rules
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(names.len(), unique.len(), "duplicate rules: {names:?}");
+    }
+
+    #[test]
+    fn saving_and_loading_does_not_duplicate_rules() {
+        // The trap: `save` writes the resolved policy, rules and all. If
+        // loading it back merged the built-in rules in again, the list would
+        // double on every save, and a repeated save-and-restart cycle would
+        // grow it without bound.
+        let mut path = std::env::temp_dir();
+        path.push(format!("supasafe-roundtrip-{}.toml", std::process::id()));
+
+        let original = Config::default();
+        let expected = original.policies["production"].rules.len();
+
+        original.save(&path).unwrap();
+        let once = Config::load(&path).unwrap();
+        assert_eq!(once.policies["production"].rules.len(), expected);
+
+        once.save(&path).unwrap();
+        let twice = Config::load(&path).unwrap();
+        assert_eq!(
+            twice.policies["production"].rules.len(),
+            expected,
+            "rules multiplied across a save and load cycle"
+        );
+
+        // And the policy still behaves the same way.
+        let compiled = twice.compile().unwrap();
+        let policy = compiled.policy("production").unwrap();
+        let stmt = analyze_statement("SELECT 1");
+        let risk = score(&stmt, &RiskInput::default());
+        assert_eq!(
+            policy
+                .evaluate(&MatchContext {
+                    statement: &stmt,
+                    risk: &risk,
+                    environment: Environment::Production,
+                    agent: None,
+                })
+                .decision,
+            Decision::Allow
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saving_leaves_no_temporary_file_behind() {
+        // Bind-mounting a single config file into a container makes rename
+        // fail with EBUSY, and an earlier version left a half-written
+        // `.toml.tmp` sitting next to the real config every time somebody
+        // pressed save.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("supasafe-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("supasafe.toml");
+
+        Config::default().save(&path).unwrap();
+        assert!(path.exists());
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_over_an_existing_file_replaces_it_cleanly() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("supasafe-overwrite-{}.toml", std::process::id()));
+        std::fs::write(&path, "# stale content that must not survive\n").unwrap();
+
+        Config::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("stale content"));
+        assert!(Config::load(&path).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saving_refuses_to_write_something_that_would_not_load() {
+        let mut config = Config::default();
+        config.policies.get_mut("production").unwrap().default = "maybe".into();
+        let mut path = std::env::temp_dir();
+        path.push(format!("supasafe-bad-{}.toml", std::process::id()));
+        assert!(config.save(&path).is_err());
+        assert!(!path.exists(), "an invalid config was written anyway");
+    }
+
+    #[test]
+    fn rules_can_be_added_moved_and_removed() {
+        let mut config = Config::default();
+        let before = config.policies["production"].rules.len();
+
+        let rule = Rule {
+            name: "local".into(),
+            action: "deny".into(),
+            approvals: None,
+            message: None,
+            when: crate::policy::Matcher {
+                objects: vec!["public.secrets".into()],
+                ..Default::default()
+            },
+        };
+
+        // New rules go to the front, because the first match wins.
+        config.add_rule("production", rule, None).unwrap();
+        assert_eq!(config.policies["production"].rules[0].name, "local");
+        assert_eq!(config.policies["production"].rules.len(), before + 1);
+
+        config.move_rule("production", 0, 3).unwrap();
+        assert_eq!(config.policies["production"].rules[3].name, "local");
+
+        let removed = config.remove_rule("production", 3).unwrap();
+        assert_eq!(removed.name, "local");
+        assert_eq!(config.policies["production"].rules.len(), before);
+    }
+
+    #[test]
+    fn an_invalid_rule_is_rejected_before_it_is_stored() {
+        let mut config = Config::default();
+        let before = config.policies["production"].rules.len();
+        let result = config.add_rule(
+            "production",
+            Rule {
+                name: "broken".into(),
+                action: "deny".into(),
+                approvals: None,
+                message: None,
+                when: crate::policy::Matcher {
+                    objects: vec!["[".into()],
+                    ..Default::default()
+                },
+            },
+            None,
+        );
+        assert!(result.is_err());
+        // The bad rule must not be left behind in the policy.
+        assert_eq!(config.policies["production"].rules.len(), before);
     }
 
     #[test]

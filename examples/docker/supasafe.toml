@@ -1,5 +1,9 @@
 # The compose example declares the database as production so you can watch the
 # production policy work without owning a production database.
+#
+# This is the seed. On first start the compose file copies it into the
+# container's writable volume, so rule changes made in the dashboard are saved
+# and survive a restart. `docker compose down -v` resets to this file.
 
 [audit]
 path = "/var/lib/supasafe/audit.jsonl"
@@ -8,13 +12,25 @@ stdout_json = true
 [snapshots]
 directory = "/var/lib/supasafe/snapshots"
 
+[server]
+# On by default. Turn it off if you publish the dashboard beyond loopback: an
+# edit there changes what the proxy lets through, on the next statement.
+allow_policy_editing = true
+
 [proxy]
-# The database is on the container network, so there is nothing to protect with
-# TLS here. Do not copy this line to a real deployment.
+# The database is on the container network, so there is nothing here for TLS to
+# protect. Do not copy this line to a real deployment.
 upstream_tls = false
 
-# With this set, blast radius is measured rather than estimated: real row
-# counts from pg_class, real cascade paths from pg_constraint.
+# With this set, blast radius is measured rather than estimated: real row counts
+# from pg_class, real cascade paths from pg_constraint. Watch what
+# `DELETE FROM signups` reports with and without it.
+#
+# In a real deployment this is a read-only role, not the superuser:
+#
+#   CREATE ROLE supasafe_readonly LOGIN PASSWORD '...';
+#   GRANT pg_read_all_stats TO supasafe_readonly;
+#   GRANT USAGE ON SCHEMA public TO supasafe_readonly;
 introspection_url = "postgresql://postgres:postgres@postgres:5432/postgres"
 
 [[database]]
@@ -22,3 +38,14 @@ name = "demo"
 host = "postgres"
 environment = "production"
 policy = "production"
+
+# Rules you add here go in front of the built-in production rules, and the first
+# match wins. Uncomment this one and run `docker compose restart supasafe` to
+# watch it take effect, or add the same rule from the dashboard and watch it
+# apply without a restart.
+#
+# [[policies.production.rules]]
+# name = "billing-is-off-limits"
+# action = "deny"
+# message = "The billing schema is reconciled nightly. Changes go through finance."
+# when = { objects = ["billing.*"], categories = ["write", "ddl"] }

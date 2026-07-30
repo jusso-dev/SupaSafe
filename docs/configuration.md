@@ -28,12 +28,14 @@ introspection_url = "postgresql://supasafe_readonly:...@host/db"
 network cannot. Change that deliberately.
 
 `upstream_tls` is on by default and skipped automatically for loopback and Unix
-socket connections, where there is no network to protect.
+socket connections, where there is no network to protect. It governs the
+introspection connection too, so there are not two TLS settings that can
+disagree with each other.
 
 `introspection_url` is the one setting worth adding. Without it, blast radius is
-a structural estimate. With it, SupaSafe reads `pg_class`, `pg_constraint` and
-`pg_index` and reports real row counts and real cascade paths. Give it a
-read-only role:
+a structural estimate. With it, SupaSafe connects on startup and every five
+minutes, reads `pg_class`, `pg_constraint` and `pg_index`, and reports real row
+counts and real cascade paths. Give it a read-only role:
 
 ```sql
 CREATE ROLE supasafe_readonly LOGIN PASSWORD '...';
@@ -41,17 +43,35 @@ GRANT pg_read_all_stats TO supasafe_readonly;
 GRANT USAGE ON SCHEMA public TO supasafe_readonly;
 ```
 
+The introspection connection is separate from the ones agents use. It carries
+no agent statements, and it authenticates with its own credentials over
+SCRAM-SHA-256, MD5, cleartext or trust. It is also what snapshots run under, so
+this is the role that needs enough access to `pg_dump` what you want captured.
+
+When it cannot connect, SupaSafe logs a warning, carries on with structural
+estimates, and marks every approval card `measured: false`. It does not refuse
+to start, and it does not present guesses as measurements.
+
 ## `[server]`
 
 ```toml
 [server]
 listen = "127.0.0.1:7717"
 open_browser = false
+allow_policy_editing = true
 ```
 
 The dashboard, and the approval API. The approve endpoint is the one thing in
 SupaSafe that turns a refusal into an execution, so exposing it to a network is
 a decision to make on purpose.
+
+`allow_policy_editing` controls whether rules can be changed from the dashboard.
+On by default, because tuning a rule you cannot try out is guesswork. Turn it
+off if the dashboard is reachable from anywhere but your own machine: an edit
+there changes what the proxy lets through, on the next statement.
+
+With it off, the dashboard still shows every rule and still lets you test SQL
+against them. It just will not save.
 
 ## `[audit]`
 

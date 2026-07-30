@@ -165,6 +165,65 @@ message = "SupaSafe cannot see inside a DO block or a dynamic EXECUTE. Write the
 when = { any_flags = ["opaque_body"] }
 ```
 
+## Editing rules from the dashboard
+
+Everything in this document can also be done at `http://127.0.0.1:7717`, under
+**Rules the proxy enforces**. The two are the same thing: the dashboard writes
+to `supasafe.toml`, and a change made either way applies to the next statement
+without a restart.
+
+The dashboard adds one thing the file cannot: a **Test** box inside the rule
+editor. Paste a statement and see what happens with and without your draft
+before you save it.
+
+```
+as it is now      allow    risk 0
+with this rule    deny     risk 0 · matched "no-secrets"
+```
+
+When a draft rule does not change the outcome, it says so. That is usually
+because an earlier rule already decided, which is the single most common
+mistake when writing rules and the hardest to spot by reading.
+
+### Ordering from the dashboard
+
+The ↑ and ↓ buttons move a rule earlier or later. Rules are numbered because
+the first match wins, so a rule that never seems to fire is normally sitting
+behind one that already matched.
+
+### What the API does
+
+The dashboard has no privileges of its own; it calls the same endpoints you
+can:
+
+| | |
+|---|---|
+| `GET /api/policies` | every policy, its settings, and its rules in order |
+| `GET /api/policies/vocabulary` | the kinds, categories, flags and actions a rule can use |
+| `POST /api/policies/try` | evaluate SQL with and without a draft rule, changing nothing |
+| `POST /api/policies/{policy}/rules` | add a rule (to the front by default) |
+| `PUT /api/policies/{policy}/rules/{i}` | replace a rule |
+| `DELETE /api/policies/{policy}/rules/{i}` | remove a rule |
+| `POST /api/policies/{policy}/rules/{i}/move` | reorder, with `{"to": n}` |
+| `PUT /api/policies/{policy}/settings` | thresholds and guards |
+| `GET`/`PUT /api/config` | the whole file as TOML |
+| `POST /api/config/reload` | re-read the file after a hand edit |
+
+```sh
+curl -X POST http://127.0.0.1:7717/api/policies/production/rules \
+  -H 'content-type: application/json' \
+  -d '{"name":"no-secrets","action":"deny",
+       "message":"The secrets table is not for agents.",
+       "when":{"objects":["public.secrets"]}}'
+```
+
+Every write is compiled before it is installed or saved. A glob with a syntax
+error is a 400 and the running policy is untouched, so there is no path that
+leaves the proxy enforcing something it cannot parse.
+
+Turn the whole thing off with `allow_policy_editing = false` under `[server]`.
+Rules stay visible and testable; they cannot be saved.
+
 ## Testing a policy
 
 ```sh

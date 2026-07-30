@@ -1,27 +1,30 @@
 # Examples
 
-## `docker/` — try it without owning a production database
+## Running it locally
+
+The compose file is at the repository root, not here:
 
 ```sh
-cd examples/docker
-docker compose up
+docker compose up --build
 ```
 
-PostgreSQL with a seeded schema (8,412 signups, 20,000 orders, 60,000 order
-items, wired together with `ON DELETE CASCADE`), and SupaSafe in front of it
-declared as production. The database port is not published, so the only way in
-is through the proxy. That is the arrangement you want in real life too.
+`docker/` holds what it uses: `seed.sql` builds the demo schema (8,412 signups,
+20,000 orders, 60,000 order items, wired together with `ON DELETE CASCADE`) and
+`supasafe.toml` is the configuration it starts from.
 
 ```sh
 # allowed
 psql postgresql://postgres:postgres@127.0.0.1:6432/postgres -c "SELECT count(*) FROM signups"
 
-# blocked, and the blast radius is measured rather than estimated,
-# because the compose file gives SupaSafe a read-only introspection connection
+# held for approval, with a measured blast radius: 88,412 rows across three
+# tables, two of which the statement does not mention
 psql postgresql://postgres:postgres@127.0.0.1:6432/postgres -c "DELETE FROM signups"
 ```
 
-Dashboard at http://127.0.0.1:7717.
+Dashboard at http://127.0.0.1:7717, including the rule editor.
+
+See [Running with Docker](../README.md#running-with-docker) for the full
+description.
 
 ## `ci/` — check migrations in a pull request
 

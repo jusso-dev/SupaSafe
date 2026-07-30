@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
+pub mod introspect;
 pub mod protocol;
 pub mod session;
 pub mod tls;

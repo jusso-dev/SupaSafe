@@ -31,7 +31,7 @@ handles.
 |---|---|
 | `supasafe-parser` | SQL to a semantic model. Statement kinds, objects, predicate analysis, flags. No regex. |
 | `supasafe-core` | Environment detection, risk, blast radius, policy, rollback, snapshots, audit, approvals. `Guard` ties them together. |
-| `supasafe-proxy` | The wire protocol, the session state machine, TLS. |
+| `supasafe-proxy` | The wire protocol, the session state machine, TLS, and a small read-only client for introspection. |
 | `supasafe-server` | Dashboard and approval API. |
 | `supasafe-mcp` | MCP server over stdio. |
 | `supasafe-cli` | The `supasafe` binary. |
@@ -70,6 +70,14 @@ decided, so the answer cannot drift between them.
    row counts from `pg_class.reltuples`, foreign keys from `pg_constraint`,
    cascade paths walked recursively with cycle protection. Without a catalogue
    it produces structural estimates and says so.
+
+   The snapshot comes from a background task that connects with its own
+   credentials every five minutes and runs three read-only queries. It uses a
+   deliberately small PostgreSQL client, about four hundred lines: startup,
+   authentication, simple query, text results. Enough to read `pg_class`, and no
+   more surface than that needs. Authentication covers trust, cleartext, MD5 and
+   SCRAM-SHA-256, and the SCRAM server proof is verified rather than ignored, so
+   something that merely answers the handshake cannot impersonate the database.
 
 7. **Decide.** Policy guards run first (protected surfaces, unparsed
    statements), then ordered rules where the first match wins, then the default
@@ -126,6 +134,26 @@ There is an end-to-end test for that one: a batch of
 `BEGIN; DROP TABLE t; INSERT INTO t VALUES (2); COMMIT;` must leave the table
 untouched and the insert unapplied.
 
+## Editing policy while it is running
+
+`Guard` holds its configuration behind a lock, so a rule changed in the
+dashboard applies to the next statement. Tuning a rule you cannot try out is
+guesswork, and restarting a proxy to try one is how people stop trying.
+
+Every edit runs against a copy of the configuration. The copy is compiled first,
+and only a configuration that compiled is installed or written to disk. A rule
+with a bad glob is a 400 and the running policy does not move.
+
+The write itself prefers a temporary file and a rename. When that cannot work,
+which is what happens when a single config file is bind-mounted into a container
+and `rename` hits `EBUSY`, it falls back to writing in place and reports a
+permission problem accurately rather than blaming the rename.
+
+Two guards run before any rule and no rule can pass them: protected managed
+surfaces, and unparseable statements. Turning either off is an explicit change
+to `protect_managed_surfaces` or `deny_unparsed`, not something a rule can do
+sideways.
+
 ## Threat model
 
 **What SupaSafe defends against.** An AI agent with legitimate database
@@ -139,7 +167,9 @@ that reaches the model through data it read.
 - An agent with a direct connection string. SupaSafe is in the path because you
   put it there. Give agents the proxy's address and nothing else.
 - A malicious operator. Anyone who can edit `supasafe.toml` can allow anything,
-  and anyone who can write the audit file can rewrite the whole chain.
+  and anyone who can write the audit file can rewrite the whole chain. The
+  dashboard's rule editor is the same authority in a browser, which is why it
+  binds to loopback and can be switched off with `allow_policy_editing`.
 - What a statement does once it is running. SupaSafe decides whether something
   executes, not what happens inside a function it approved.
 - Anything that is not SQL. Direct filesystem access to the data directory,

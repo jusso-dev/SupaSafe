@@ -275,6 +275,15 @@ pub struct Policy {
     /// adds one rule rather than silently discarding the twelve that were
     /// already there.
     pub extends: Option<String>,
+    /// Whether this policy's rules are added to the rules of the policy it
+    /// extends, or replace them.
+    ///
+    /// True by default, so that hand-writing one `[[policies.production.rules]]`
+    /// block adds a rule rather than silently discarding the twelve that were
+    /// already there. SupaSafe sets it to false in files it writes itself,
+    /// because those already contain the full list and merging again would
+    /// duplicate every rule on each save.
+    pub inherit_rules: bool,
     /// A sentence describing the intent of this policy.
     pub description: String,
     /// What happens to a statement no rule matched and no threshold caught.
@@ -307,6 +316,7 @@ impl Default for Policy {
         Self {
             name: String::new(),
             extends: None,
+            inherit_rules: true,
             description: String::new(),
             default: "deny".to_string(),
             warn_above: None,
@@ -334,6 +344,8 @@ pub enum PolicyError {
     BadDefault { policy: String, action: String },
     #[error("no policy named {0:?} is defined")]
     Unknown(String),
+    #[error("{0}")]
+    Rejected(String),
 }
 
 /// A policy with its globs compiled and its actions validated.
